@@ -19,7 +19,6 @@ You are helping with an existing software project.
 ├── .gitignore
 ├── README.md
 ├── client
-│   ├── .gitignore
 │   ├── README.md
 │   ├── eslint.config.js
 │   ├── index.html
@@ -110,7 +109,8 @@ You are helping with an existing software project.
     └── services
         ├── chat
         │   ├── chatServices.js
-        │   └── conversationManager.js
+        │   ├── conversationManager.js
+        │   └── proactiveChat.js
         ├── llm
         │   └── grok.js
         ├── memory
@@ -119,7 +119,14 @@ You are helping with an existing software project.
         ├── prompt
         │   └── promptBuilder.js
         ├── vision
-        │   └── visionService.js
+        │   ├── contextBuilder.js
+        │   ├── cooldownManager.js
+        │   ├── emotionPhrasing.js
+        │   ├── eventGenerator.js
+        │   ├── habitLearner.js
+        │   ├── observationGenerator.js
+        │   ├── visionService.js
+        │   └── visionStateManager.js
         └── voice
             └── elevenlabsService.js
 ```
@@ -129,37 +136,148 @@ FILE: .gitignore
 ===============================================================================
 
 ```text
-```
+# ===========================================
+# Dependencies
+# ===========================================
+**/node_modules/
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
 
-===============================================================================
-FILE: client/.gitignore
-===============================================================================
+# ===========================================
+# Environment Variables
+# ===========================================
+.env
+.env.*
+!.env.example
+!.env.template
 
-```text
+# ===========================================
 # Logs
-logs
+# ===========================================
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# ===========================================
+# Python
+# ===========================================
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+*.so
+*.pyd
+
+# ===========================================
+# Build Outputs
+# ===========================================
+dist/
+build/
+coverage/
+
+# React/Vite
+client/dist/
+
+# ===========================================
+# ML Models & Weights (Optional)
+# Uncomment if models are downloaded locally
+# ===========================================
+# *.onnx
+# *.pt
+# *.pth
+# *.tflite
+# *.engine
+# *.bin
+# models/
+# weights/
+
+# ===========================================
+# Temporary Files
+# ===========================================
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ===========================================
+# OS Files
+# ===========================================
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+Thumbs.db
+Desktop.ini
+
+# ===========================================
+# IDEs
+# ===========================================
+.vscode/
+.idea/
+*.iml
+
+# ===========================================
+# Python Virtual Environment Metadata
+# ===========================================
+.python-version
+pip-wheel-metadata/
+
+# ===========================================
+# Jupyter
+# ===========================================
+.ipynb_checkpoints/
+
+# ===========================================
+# Runtime Files
+# ===========================================
+*.pid
+*.seed
+*.pid.lock
+
+# ===========================================
+# Local Databases
+# ===========================================
+*.sqlite
+*.sqlite3
+
+# ===========================================
+# Cache
+# ===========================================
+.cache/
+.parcel-cache/
+.eslintcache
+
+# ===========================================
+# Generated Images/Videos (Optional)
+# ===========================================
+captures/
+recordings/
+outputs/
+
+# ===========================================
+# Secrets
+# ===========================================
+*.pem
+*.key
+*.crt
+*.p12
+
+# ===========================================
+# Misc
+# ===========================================
+*.tgz
+*.zip
 ```
 
 ===============================================================================
@@ -291,6 +409,26 @@ const TTS_BAR_WEIGHTS = [0.72, 0.88, 1.05, 1.05, 0.88, 0.72];
 const IDLE_HEIGHT = 48;
 const PEAK_RANGE = 140;
 
+function VisionStatRow({ label, value, valueColor = "#fff" }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        fontSize: "12.5px",
+        padding: "8px 0",
+        borderBottom: "1px solid rgba(255,255,255,0.04)",
+      }}
+    >
+      <span style={{ color: "rgba(255,255,255,0.45)", fontWeight: 400 }}>{label}</span>
+      <span style={{ color: valueColor, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 function App() {
   const [message, setMessage] = useState("");
   const [response, setResponse] = useState("");
@@ -304,6 +442,18 @@ function App() {
     () => localStorage.getItem("friday-speaker") === "true",
   );
   const [levels, setLevels] = useState([48, 48, 48, 48, 48, 48]);
+
+  // --- Unified vision mode: only one camera consumer can run at a time ---
+  // 'off'   -> no camera in use
+  // 'live'  -> browser webcam streams frames to /api/vision/frame (interactive Friday)
+  // 'debug' -> ml-server (Python/OpenCV) camera + debug panel
+  const [visionMode, setVisionMode] = useState(
+    () => localStorage.getItem("friday-vision-mode") || "off",
+  );
+  const [visionData, setVisionData] = useState({ faces: [], timestamp: null });
+  const [visionOnline, setVisionOnline] = useState(false);
+  const [cameraRunning, setCameraRunning] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
 
   const sessionId = useRef(
     localStorage.getItem("friday-session") || crypto.randomUUID(),
@@ -334,6 +484,15 @@ function App() {
   const speechVoicesRef = useRef([]);
   const isSpeakingRef = useRef(false);
 
+  // Interactive vision refs
+  const webcamStreamRef = useRef(null);
+  const webcamVideoRef = useRef(null);
+  const webcamCanvasRef = useRef(null);
+  const frameCaptureIntervalRef = useRef(null);
+  const isSendingFrameRef = useRef(false);
+  const speakerOnRef = useRef(speakerOn);
+  const isUserTalkingRef = useRef(false);
+
   // Load voices when they become available
   useEffect(() => {
     // Get voices immediately if available
@@ -353,6 +512,15 @@ function App() {
       window.speechSynthesis.onvoiceschanged = null;
     };
   }, []);
+
+  // Keep refs in sync to avoid stale closures
+  useEffect(() => {
+    speakerOnRef.current = speakerOn;
+  }, [speakerOn]);
+
+  useEffect(() => {
+    isUserTalkingRef.current = isListening;
+  }, [isListening]);
 
   useEffect(() => {
     if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
@@ -387,10 +555,71 @@ function App() {
     }
   }, [response, showResponse]);
 
+  // Poll ml-server for live face/emotion results while in debug mode
+  useEffect(() => {
+    if (visionMode !== "debug") return;
+
+    let cancelled = false;
+
+    const checkStatusAndStart = async () => {
+      try {
+        const res = await fetch("http://localhost:5001/vision/status");
+        const data = await res.json();
+        if (cancelled) return;
+        setVisionOnline(true);
+        setCameraRunning(data.running);
+        if (!data.running) {
+          startCamera();
+        }
+      } catch (e) {
+        if (!cancelled) setVisionOnline(false);
+      }
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch("http://localhost:5001/vision/result");
+        const data = await res.json();
+        if (!cancelled) {
+          setVisionData(data);
+          setVisionOnline(true);
+        }
+      } catch (e) {
+        if (!cancelled) setVisionOnline(false);
+      }
+    };
+
+    checkStatusAndStart();
+    poll();
+    const interval = setInterval(poll, 500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionMode]);
+
+  // Interactive (browser webcam) capture — only runs in 'live' mode
+  useEffect(() => {
+    localStorage.setItem("friday-vision-mode", visionMode);
+
+    if (visionMode === "live") {
+      startVisionCapture();
+    } else {
+      stopVisionCapture();
+    }
+
+    return () => stopVisionCapture();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionMode]);
+
   useEffect(() => {
     return () => {
       stopMicVisualizer();
       stopTTSPlayback();
+      stopVisionCapture();
+      if (cameraRunning) stopCamera();
       if (speechUtteranceRef.current) {
         window.speechSynthesis.cancel();
       }
@@ -471,17 +700,17 @@ function App() {
       if (!isSpeakingRef.current) return;
 
       const elapsed = (Date.now() - ttsStartTimeRef.current) / 1000;
-      
+
       // Generate a realistic speech-like waveform using multiple sine waves
       // and noise to simulate speech patterns
-      const speechPattern = 
+      const speechPattern =
         Math.sin(elapsed * 2.5) * 0.4 + // Base rhythm
         Math.sin(elapsed * 4.7 + 0.5) * 0.3 + // Faster variation
         Math.sin(elapsed * 1.2 + 1.2) * 0.2 + // Slower modulation
         (Math.sin(elapsed * 8.3) * 0.1 + 0.5) * 0.2; // Noise-like variation
 
       // Normalize to 0-1 range with some envelope shaping
-      const normalized = Math.max(0, Math.min(1, 
+      const normalized = Math.max(0, Math.min(1,
         (speechPattern + 0.8) / 1.6 * 0.9 + 0.1
       ));
 
@@ -515,12 +744,12 @@ function App() {
 
   const stopTTSPlayback = () => {
     isSpeakingRef.current = false;
-    
+
     if (ttsRafRef.current) {
       cancelAnimationFrame(ttsRafRef.current);
       ttsRafRef.current = null;
     }
-    
+
     // Stop speech synthesis
     if (speechUtteranceRef.current) {
       window.speechSynthesis.cancel();
@@ -541,7 +770,7 @@ function App() {
 
   const playTTS = (text) => {
     if (!text.trim()) return;
-    
+
     // Cancel any ongoing speech
     window.speechSynthesis.cancel();
     stopTTSPlayback();
@@ -558,18 +787,18 @@ function App() {
 
       // Find Google UK English Female voice
       const voices = speechVoicesRef.current;
-      const preferredVoice = voices.find(v => 
-        v.name === "Google UK English Female" || 
+      const preferredVoice = voices.find(v =>
+        v.name === "Google UK English Female" ||
         v.name.includes("Google UK English Female")
       );
-      
+
       if (preferredVoice) {
         utterance.voice = preferredVoice;
         console.log("Using voice:", preferredVoice.name);
       } else {
         // Fallback to any Google voice or English voice
-        const fallbackVoice = voices.find(v => 
-          v.name.includes("Google") || 
+        const fallbackVoice = voices.find(v =>
+          v.name.includes("Google") ||
           v.lang.startsWith("en")
         );
         if (fallbackVoice) {
@@ -604,6 +833,126 @@ function App() {
     }
   };
 
+  const playRemoteAudio = (base64Audio) => {
+    if (!base64Audio) return;
+
+    window.speechSynthesis.cancel();
+    stopTTSPlayback();
+
+    const audio = new Audio(`data:audio/mpeg;base64,${base64Audio}`);
+
+    ttsStartTimeRef.current = Date.now();
+    setIsSpeaking(true);
+    startTTSVisualizer();
+
+    audio.onended = () => stopTTSPlayback();
+    audio.onerror = (e) => {
+      console.error("Vision audio playback error:", e);
+      stopTTSPlayback();
+    };
+
+    audio.play().catch((err) => {
+      console.error("Audio play blocked:", err);
+      stopTTSPlayback();
+    });
+  };
+
+  const captureAndSendFrame = async () => {
+    if (isSendingFrameRef.current) return;
+
+    const video = webcamVideoRef.current;
+    const canvas = webcamCanvasRef.current;
+    if (!video || !canvas || video.readyState < 2) return;
+
+    isSendingFrameRef.current = true;
+
+    try {
+      const ctx = canvas.getContext("2d");
+      canvas.width = video.videoWidth || 480;
+      canvas.height = video.videoHeight || 360;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const frame = canvas.toDataURL("image/jpeg", 0.7);
+
+      const res = await fetch("http://localhost:5000/api/vision/frame", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: sessionId.current,
+          frame,
+          isUserTalking: isUserTalkingRef.current,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (data?.responses?.length) {
+        const [first] = data.responses;
+
+        setInputMode(null);
+        setResponse(formatResponse(first.text));
+        setShowResponse(true);
+
+        if (speakerOnRef.current) {
+          playRemoteAudio(first.audio);
+        }
+      }
+    } catch (err) {
+      console.error("Vision frame error:", err);
+    } finally {
+      isSendingFrameRef.current = false;
+    }
+  };
+
+  const startVisionCapture = async () => {
+    try {
+      // Release the Python-side camera first so the browser can claim the device
+      if (cameraRunning) {
+        await stopCamera();
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 480, height: 360 },
+      });
+
+      webcamStreamRef.current = stream;
+
+      if (webcamVideoRef.current) {
+        webcamVideoRef.current.srcObject = stream;
+        await webcamVideoRef.current.play();
+      }
+
+      frameCaptureIntervalRef.current = setInterval(captureAndSendFrame, 3000);
+    } catch (err) {
+      console.error("Vision capture error:", err);
+      setVisionMode("off");
+    }
+  };
+
+  const stopVisionCapture = () => {
+    if (frameCaptureIntervalRef.current) {
+      clearInterval(frameCaptureIntervalRef.current);
+      frameCaptureIntervalRef.current = null;
+    }
+    webcamStreamRef.current?.getTracks().forEach((t) => t.stop());
+    webcamStreamRef.current = null;
+  };
+
+  const switchVisionMode = async (mode) => {
+    if (mode === visionMode) return;
+
+    // Always release the browser camera before switching away from 'live'
+    if (visionMode === "live") {
+      stopVisionCapture();
+    }
+    // Always release the Python camera before switching away from 'debug'
+    if (visionMode === "debug" && cameraRunning) {
+      await stopCamera();
+    }
+
+    setVisionMode(mode);
+  };
+
   const toggleListening = async () => {
     if (isListening) {
       recognitionRef.current?.stop();
@@ -628,6 +977,35 @@ function App() {
       if (!next) stopTTSPlayback();
       return next;
     });
+  };
+
+  const startCamera = async () => {
+    setCameraStarting(true);
+    try {
+      const res = await fetch("http://localhost:5001/vision/start", {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (data.status === "started" || data.status === "already_running") {
+        setCameraRunning(true);
+      } else {
+        console.error("Camera start failed:", data.message);
+      }
+    } catch (err) {
+      console.error("Camera start error:", err);
+    } finally {
+      setCameraStarting(false);
+    }
+  };
+
+  const stopCamera = async () => {
+    try {
+      await fetch("http://localhost:5001/vision/stop", { method: "POST" });
+    } catch (err) {
+      console.error("Camera stop error:", err);
+    } finally {
+      setCameraRunning(false);
+    }
   };
 
   const handleTextSubmit = (e) => {
@@ -733,25 +1111,87 @@ function App() {
         <div style={{ color: "#fff", fontSize: "18px", fontWeight: 500, letterSpacing: "0.5px" }}>
           Friday
         </div>
-        {response && (
-          <button
-            onClick={toggleResponseView}
-            style={{
-              background: "none",
-              border: `1px solid ${showResponse ? "#0a84ff" : "rgba(255,255,255,0.2)"}`,
-              color: showResponse ? "#0a84ff" : "#fff",
-              padding: "6px 16px",
-              borderRadius: "20px",
-              fontSize: "13px",
-              cursor: "pointer",
-              transition: "all 0.3s",
-              fontFamily: "inherit",
-              letterSpacing: "0.3px",
-            }}
-          >
-            {showResponse ? "Hide Response" : "View Response"}
-          </button>
-        )}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            borderRadius: "22px",
+            padding: "4px",
+          }}
+        >
+          {[
+            { key: "off", label: "Vision Off" },
+            { key: "live", label: "Friday's Watching" },
+            { key: "debug", label: "Debug" },
+          ].map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => switchVisionMode(key)}
+              style={{
+                background: visionMode === key ? "#fff" : "transparent",
+                color: visionMode === key ? "#000" : "rgba(255,255,255,0.6)",
+                border: "none",
+                padding: "7px 14px",
+                borderRadius: "18px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: "pointer",
+                letterSpacing: "0.2px",
+                transition: "all 0.25s ease",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              {key === "live" && (
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: visionMode === "live" ? "#0a84ff" : "rgba(255,255,255,0.3)",
+                  }}
+                />
+              )}
+              {key === "debug" && (
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor:
+                      visionMode === "debug" && visionOnline ? "#34c759" : "rgba(255,255,255,0.3)",
+                  }}
+                />
+              )}
+              {label}
+            </button>
+          ))}
+
+          {response && (
+            <button
+              onClick={toggleResponseView}
+              style={{
+                background: showResponse ? "#0a84ff" : "transparent",
+                color: showResponse ? "#fff" : "rgba(255,255,255,0.6)",
+                border: "none",
+                padding: "7px 14px",
+                borderRadius: "18px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: "pointer",
+                letterSpacing: "0.2px",
+                marginLeft: "6px",
+              }}
+            >
+              {showResponse ? "Hide" : "Response"}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Main Content Area */}
@@ -1128,6 +1568,167 @@ function App() {
           </motion.button>
         </div>
       </div>
+
+      {/* Hidden video and canvas for interactive vision capture */}
+      <video ref={webcamVideoRef} style={{ display: "none" }} muted playsInline />
+      <canvas ref={webcamCanvasRef} style={{ display: "none" }} />
+
+      {/* Vision Debug Panel */}
+      <AnimatePresence>
+        {visionMode === "debug" && (
+          <motion.div
+            initial={{ opacity: 0, x: 20, scale: 0.98 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 20, scale: 0.98 }}
+            style={{
+              position: "fixed",
+              right: "20px",
+              top: "80px",
+              width: "340px",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              background: "linear-gradient(180deg, #131313 0%, #0a0a0a 100%)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: "16px",
+              padding: "18px",
+              color: "#fff",
+              zIndex: 100,
+              fontFamily: "'SF Pro Display', -apple-system, sans-serif",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "14px",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  letterSpacing: "0.4px",
+                  textTransform: "uppercase",
+                  color: "rgba(255,255,255,0.5)",
+                }}
+              >
+                Vision Debug
+              </span>
+              <span
+                style={{
+                  fontSize: "11px",
+                  color: visionOnline ? "#34c759" : "#ff3b30",
+                  fontWeight: 600,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "5px",
+                }}
+              >
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: visionOnline ? "#34c759" : "#ff3b30",
+                  }}
+                />
+                {visionOnline ? "Online" : "Offline"}
+              </span>
+            </div>
+
+            <button
+              onClick={cameraRunning ? stopCamera : startCamera}
+              disabled={cameraStarting}
+              style={{
+                width: "100%",
+                background: cameraRunning ? "rgba(255,59,48,0.12)" : "rgba(52,199,89,0.12)",
+                border: `1px solid ${cameraRunning ? "rgba(255,59,48,0.4)" : "rgba(52,199,89,0.4)"}`,
+                color: cameraRunning ? "#ff6961" : "#41d67c",
+                padding: "9px 0",
+                borderRadius: "10px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: cameraStarting ? "not-allowed" : "pointer",
+                opacity: cameraStarting ? 0.5 : 1,
+                marginBottom: "12px",
+              }}
+            >
+              {cameraStarting ? "Starting…" : cameraRunning ? "Stop Camera" : "Start Camera"}
+            </button>
+
+            <img
+              src="http://localhost:5001/vision/stream"
+              alt="Live camera feed"
+              style={{
+                width: "100%",
+                borderRadius: "10px",
+                display: "block",
+                marginBottom: "16px",
+                backgroundColor: "#000",
+                minHeight: "180px",
+                objectFit: "cover",
+                border: "1px solid rgba(255,255,255,0.06)",
+              }}
+              onError={(e) => {
+                e.currentTarget.style.opacity = "0.3";
+              }}
+            />
+
+            <div
+              style={{
+                background: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.06)",
+                borderRadius: "10px",
+                padding: "4px 12px",
+              }}
+            >
+              <VisionStatRow
+                label="Face Present"
+                value={visionData.faces?.length > 0 ? "Yes" : "No"}
+                valueColor={visionData.faces?.length > 0 ? "#34c759" : "#ff9f0a"}
+              />
+              <VisionStatRow label="People" value={visionData.faces?.length ?? 0} />
+              <VisionStatRow
+                label="Emotion"
+                value={visionData.faces?.[0]?.emotion ?? "-"}
+              />
+              <VisionStatRow
+                label="Confidence"
+                value={
+                  visionData.faces?.[0]?.confidence
+                    ? `${(visionData.faces[0].confidence * 100).toFixed(1)}%`
+                    : "-"
+                }
+              />
+              {visionData.faces?.[0]?.box && (
+                <VisionStatRow
+                  label="Box"
+                  value={`${Math.round(visionData.faces[0].box.width)}×${Math.round(
+                    visionData.faces[0].box.height,
+                  )}`}
+                />
+              )}
+            </div>
+
+            <div
+              style={{
+                marginTop: "12px",
+                fontSize: "10.5px",
+                color: "rgba(255,255,255,0.3)",
+                textAlign: "right",
+                letterSpacing: "0.2px",
+              }}
+            >
+              Updated{" "}
+              {visionData.timestamp
+                ? new Date(visionData.timestamp * 1000).toLocaleTimeString()
+                : "—"}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -2138,6 +2739,32 @@ FILE: server/controllers/visionController.js
 ===============================================================================
 
 ```js
+import { processFrame } from "../services/vision/visionService.js";
+
+export const analyzeVisionFrame = async (req, res) => {
+  try {
+    const { sessionId, frame, isUserTalking } = req.body;
+
+    if (!sessionId || !frame) {
+      return res.status(400).json({ error: "sessionId and frame are required" });
+    }
+
+    const result = await processFrame({ sessionId, frame, isUserTalking });
+
+    res.json({
+      faces: result.state.faceCount,
+      emotion: result.state.emotion,
+      events: result.events.map((e) => e.type),
+      responses: result.spoken.map((s) => ({
+        text: s.text,
+        audio: s.audio.toString("base64"),
+      })),
+    });
+  } catch (err) {
+    console.error("Vision analysis error:", err);
+    res.status(500).json({ error: "Vision analysis failed" });
+  }
+};
 ```
 
 ===============================================================================
@@ -2145,6 +2772,23 @@ FILE: server/ml/camera/frameProcessor.js
 ===============================================================================
 
 ```js
+// Normalizes whatever the client sends (base64 string or raw Buffer) into
+// a Buffer that ml/pipeline.js can process. No capture/hardware logic here —
+// frames are pushed in via the API.
+
+export function toImageBuffer(frameData) {
+  if (Buffer.isBuffer(frameData)) return frameData;
+
+  if (typeof frameData === "string") {
+    const base64 = frameData.includes(",")
+      ? frameData.split(",")[1]
+      : frameData;
+
+    return Buffer.from(base64, "base64");
+  }
+
+  throw new Error("Unsupported frame format");
+}
 ```
 
 ===============================================================================
@@ -2280,6 +2924,36 @@ FILE: server/ml/emotion/preprocess.js
 ===============================================================================
 
 ```js
+// import sharp from "sharp";
+// import * as ort from "onnxruntime-node";
+
+// const SIZE = 64;
+
+// export async function preprocess(faceBuffer) {
+
+//     const { data } = await sharp(faceBuffer)
+//         .resize(SIZE, SIZE)
+//         .grayscale()
+//         .raw()
+//         .toBuffer({ resolveWithObject: true });
+
+//     const input = new Float32Array(SIZE * SIZE);
+
+//     for (let i = 0; i < data.length; i++) {
+
+//         input[i] = (data[i] / 255 - 0.5) / 0.5;
+
+//     }
+
+//     return new ort.Tensor(
+//         "float32",
+//         input,
+//         [1, 1, SIZE, SIZE]
+//     );
+// }
+
+
+
 import sharp from "sharp";
 import * as ort from "onnxruntime-node";
 
@@ -2293,12 +2967,12 @@ export async function preprocess(faceBuffer) {
         .raw()
         .toBuffer({ resolveWithObject: true });
 
+    // FER+ expects raw float32 pixel values (0-255), NOT normalized.
+    // Matches ml-server/skills/emotion/preprocess.py exactly.
     const input = new Float32Array(SIZE * SIZE);
 
     for (let i = 0; i < data.length; i++) {
-
-        input[i] = (data[i] / 255 - 0.5) / 0.5;
-
+        input[i] = data[i];
     }
 
     return new ort.Tensor(
@@ -3036,6 +3710,14 @@ FILE: server/routes/visionRoutes.js
 ===============================================================================
 
 ```js
+import express from "express";
+import { analyzeVisionFrame } from "../controllers/visionController.js";
+
+const visionRoutes = express.Router();
+
+visionRoutes.post("/frame", analyzeVisionFrame);
+
+export default visionRoutes;
 ```
 
 ===============================================================================
@@ -3050,6 +3732,7 @@ dotenv.config();
 import chatRoutes from "./routes/chatRoutes.js";
 import connectDB from "./config/db.js";
 import ttsRouter from "./routes/ttsRoutes.js";
+import visionRoutes from "./routes/visionRoutes.js";
 connectDB();
 const app = express();
 
@@ -3059,6 +3742,7 @@ app.use(express.json());
 app.use("/api/chat", chatRoutes);
 app.use("/api/tts", ttsRouter);
 
+app.use("/api/vision", visionRoutes);
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on ${process.env.PORT}`);
@@ -3179,6 +3863,57 @@ export const saveMessage = async (sessionId, role, content) => {
 // Delete an entire conversation
 export const clearConversation = async (sessionId) => {
   await Conversation.deleteOne({ sessionId });
+};
+```
+
+===============================================================================
+FILE: server/services/chat/proactiveChat.js
+===============================================================================
+
+```js
+import client from "../llm/grok.js";
+import { saveMessage } from "./conversationManager.js";
+import { generateSpeech } from "../voice/elevenlabsService.js";
+
+export const speakObservation = async ({ sessionId, context }) => {
+  const systemPrompt = `
+You are Friday, a personal AI companion who occasionally makes brief, natural remarks based on what you notice about the user, without being asked.
+
+Rules:
+- Keep it short (1-2 sentences), casual, and warm.
+- Never mention "monitoring", "detecting", "cameras", or "vision models" — just speak like a companion who noticed something.
+- Use the time of day and context to infer what might be happening (morning -> heading out, evening -> dinner), but don't force it if it doesn't fit.
+- Don't repeat the same kind of remark you've made recently.
+- If nothing worth saying fits naturally, respond with exactly: SKIP
+
+Context:
+- Observation: ${context.observation}
+- Time: ${context.currentTime}, ${context.weekday}
+- Current emotion: ${context.currentEmotion || "unknown"}
+- Time present/working: ${context.workingDurationMinutes} minutes
+- Known habits/memories:
+${context.recentMemories.length ? context.recentMemories.join("\n") : "None"}
+`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...context.recentConversation,
+    { role: "user", content: `[vision event] ${context.observation}` },
+  ];
+
+  const completion = await client.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages,
+    temperature: 0.7,
+  });
+
+  const text = completion.choices?.[0]?.message?.content?.trim();
+  if (!text || text === "SKIP") return null;
+
+  await saveMessage(sessionId, "assistant", text);
+  const audio = await generateSpeech(text);
+
+  return { text, audio };
 };
 ```
 
@@ -3397,52 +4132,7 @@ export const getMemories = async (sessionId) => {
     .limit(20);
 };
 
-// export const searchMemories = async (
-//   sessionId,
-//   embedding,
-//   limit = 5
-// ) => {
-//   const results = await Memory.aggregate([
-//     {
-//       $vectorSearch: {
-//         index: "memory_index",
-//         path: "embedding",
-//         queryVector: embedding,
-//         numCandidates: 100,
-//         limit: 20,
-//       },
-//     },
-//     {
-//       $match: {
-//         sessionId,
-//       },
-//     },
-//     {
-//       $limit: limit,
-//     },
-//     {
-//       $project: {
-//         _id: 1,
-//         content: 1,
-//         category: 1,
-//         importance: 1,
-//         score: {
-//           $meta: "vectorSearchScore",
-//         },
-//       },
-//     },
-//   ]);
 
-//   const filtered = results.filter(
-//     (memory) => memory.score >= 0.75
-//   );
-
-//   await updateMemoryAccess(
-//     filtered.map((memory) => memory._id)
-//   );
-
-//   return filtered;
-// };
 
 export const updateMemoryAccess = async (memoryIds) => {
   if (!memoryIds.length) return;
@@ -3523,6 +4213,27 @@ FILE: server/services/prompt/promptBuilder.js
 import { getRecentMessages } from "../chat/conversationManager.js";
 import { searchMemories } from "../memory/memoryManager.js";
 import { generateEmbedding } from "../embeddings/embeddingService.js";
+import { getStateSummary } from "../vision/visionStateManager.js";
+import { describeEmotion } from "../vision/emotionPhrasing.js";
+
+function buildVisionSection(sessionId) {
+  const vision = getStateSummary(sessionId);
+
+  if (!vision.initialized) {
+    return `Vision is currently OFF — you have no camera access right now. If asked whether you can see the user, say you can't right now, and that they can turn on "Friday's Watching" to let you see them. Don't guess at their appearance or mood.`;
+  }
+
+  if (!vision.present) {
+    return `Vision is ON, but no face is currently visible in the camera. If asked whether you can see the user, say the camera is on but you don't see them at the moment.`;
+  }
+
+  const emotionPhrase = describeEmotion(vision.emotion, vision.emotionConfidence);
+
+  return `Vision is ON and a face is currently visible.
+${vision.faceCount > 1 ? `There are ${vision.faceCount} people in view.` : "There is one person in view."}
+Their current expression reads as: ${emotionPhrase || "neutral"}.
+If asked whether you can see the user, answer naturally and confidently — e.g. "Yes, I can see you. You look ${emotionPhrase || "calm"} right now." Only bring up the emotion when it's relevant to what's being asked; don't force it into unrelated replies.`;
+}
 
 export const buildPrompt = async (sessionId, message) => {
   // Last few conversation messages
@@ -3532,6 +4243,7 @@ export const buildPrompt = async (sessionId, message) => {
   const embedding = await generateEmbedding(message);
   console.log("Embedding length:", embedding.length);
   console.log("First 5 values:", embedding.slice(0, 5));
+
   // Semantic search
   let memories = [];
 
@@ -3556,6 +4268,8 @@ export const buildPrompt = async (sessionId, message) => {
           .join("\n")
       : "None";
 
+  const visionSection = buildVisionSection(sessionId);
+
   return [
     {
       role: "system",
@@ -3578,6 +4292,12 @@ ${memoryContext}
 
 ----------------------------------------
 
+Current Vision Status
+
+${visionSection}
+
+----------------------------------------
+
 Respond naturally and conversationally.
       `,
     },
@@ -3593,10 +4313,402 @@ Respond naturally and conversationally.
 ```
 
 ===============================================================================
+FILE: server/services/vision/contextBuilder.js
+===============================================================================
+
+```js
+import { getRecentMessages } from "../chat/conversationManager.js";
+import { getMemories } from "../memory/memoryManager.js";
+
+export async function buildVisionContext({ sessionId, observation, state }) {
+  const now = new Date();
+  const [history, memories] = await Promise.all([
+    getRecentMessages(sessionId, 6),
+    getMemories(sessionId),
+  ]);
+
+  const workingDurationMs = state.presentSince ? Date.now() - state.presentSince : 0;
+
+  return {
+    observation,
+    currentTime: now.toLocaleTimeString(),
+    weekday: now.toLocaleDateString(undefined, { weekday: "long" }),
+    currentEmotion: state.emotion,
+    recentMemories: memories.map((m) => `[${m.category}] ${m.content}`),
+    recentConversation: history,
+    workingDurationMinutes: Math.round(workingDurationMs / 60000),
+  };
+}
+```
+
+===============================================================================
+FILE: server/services/vision/cooldownManager.js
+===============================================================================
+
+```js
+const GLOBAL_COOLDOWN_MS = 60_000;      // don't speak again too soon after any remark
+const EVENT_COOLDOWN_MS = 5 * 60_000;   // don't repeat the same kind of remark too often
+const MIN_PRIORITY_TO_SPEAK = 4;
+
+const sessionCooldowns = new Map();
+
+function getCooldown(sessionId) {
+  if (!sessionCooldowns.has(sessionId)) {
+    sessionCooldowns.set(sessionId, { isSpeaking: false, lastSpokenAt: 0, lastEventSpokenAt: {} });
+  }
+  return sessionCooldowns.get(sessionId);
+}
+
+export function canSpeak(sessionId, event, { isUserTalking = false } = {}) {
+  const c = getCooldown(sessionId);
+  const now = Date.now();
+
+  if (c.isSpeaking) return false;
+  if (isUserTalking) return false;
+  if (event.priority < MIN_PRIORITY_TO_SPEAK) return false;
+  if (now - c.lastSpokenAt < GLOBAL_COOLDOWN_MS) return false;
+  if (now - (c.lastEventSpokenAt[event.type] || 0) < EVENT_COOLDOWN_MS) return false;
+
+  return true;
+}
+
+export function markSpeaking(sessionId, isSpeaking) {
+  getCooldown(sessionId).isSpeaking = isSpeaking;
+}
+
+export function markSpoken(sessionId, event) {
+  const c = getCooldown(sessionId);
+  const now = Date.now();
+  c.lastSpokenAt = now;
+  c.lastEventSpokenAt[event.type] = now;
+}
+```
+
+===============================================================================
+FILE: server/services/vision/emotionPhrasing.js
+===============================================================================
+
+```js
+// Confidence-aware phrasing for detected emotions.
+// Shared by proactive vision remarks and reactive "can you see me?" chat answers.
+
+const HIGH_CONFIDENCE = 0.75;
+const MED_CONFIDENCE = 0.45;
+
+const PHRASES = {
+  happiness: { high: "laughing, or really happy", medium: "smiling", low: "a little pleased" },
+  sadness: { high: "quite sad", medium: "a bit down", low: "slightly low" },
+  anger: { high: "visibly frustrated or angry", medium: "a bit annoyed", low: "slightly tense" },
+  surprise: { high: "very surprised", medium: "surprised", low: "mildly surprised" },
+  fear: { high: "quite uneasy or afraid", medium: "a bit uneasy", low: "slightly on edge" },
+  disgust: { high: "quite uncomfortable", medium: "a bit uncomfortable", low: "slightly bothered" },
+  contempt: { high: "quite unimpressed", medium: "a bit unimpressed", low: "slightly skeptical" },
+  neutral: { high: "calm and neutral", medium: "calm", low: "fairly neutral" },
+};
+
+export function describeEmotion(emotion, confidence = 0) {
+  if (!emotion) return null;
+
+  const tiers = PHRASES[emotion];
+  if (!tiers) return `feeling ${emotion}`;
+
+  if (confidence >= HIGH_CONFIDENCE) return tiers.high;
+  if (confidence >= MED_CONFIDENCE) return tiers.medium;
+  return tiers.low;
+}
+```
+
+===============================================================================
+FILE: server/services/vision/eventGenerator.js
+===============================================================================
+
+```js
+const ABSENCE_THRESHOLD_MS = 10_000;
+const EMOTION_STABLE_THRESHOLD_MS = 8_000;
+const MIN_MEANINGFUL_ABSENCE_MS = 3_000;
+
+export function generateEvents(previous, current) {
+  if (!previous.initialized) return []; // don't fire on the very first frame
+
+  const now = Date.now();
+  const events = [];
+
+  if (!current.present && current.absentSince && !current.firedLeftAt) {
+    if (now - current.absentSince >= ABSENCE_THRESHOLD_MS) {
+      events.push({ type: "USER_LEFT", priority: 6, data: { awaySince: current.absentSince } });
+      current.firedLeftAt = current.absentSince;
+    }
+  }
+
+  if (current.present && !previous.present && previous.absentSince) {
+    const awayMs = now - previous.absentSince;
+    if (awayMs >= MIN_MEANINGFUL_ABSENCE_MS) {
+      events.push({ type: "USER_RETURNED", priority: 7, data: { awayMs } });
+    }
+  }
+
+  if (current.faceCount >= 2 && previous.faceCount < 2) {
+    events.push({ type: "MULTIPLE_PEOPLE", priority: 4, data: { count: current.faceCount } });
+  }
+
+  if (
+    current.present &&
+    current.emotion &&
+    current.emotionSince &&
+    !current.firedEmotionStableAt &&
+    now - current.emotionSince >= EMOTION_STABLE_THRESHOLD_MS
+  ) {
+    events.push({
+      type: `EMOTION_STABLE_${current.emotion.toUpperCase()}`,
+      priority: 5,
+      data: { emotion: current.emotion, durationMs: now - current.emotionSince },
+    });
+    current.firedEmotionStableAt = current.emotionSince;
+  }
+
+  return events;
+}
+```
+
+===============================================================================
+FILE: server/services/vision/habitLearner.js
+===============================================================================
+
+```js
+// Learns slow, recurring patterns from events instead of storing every event.
+import { saveMemory } from "../memory/memoryManager.js";
+
+const MIN_SAMPLES = 5;
+const HABIT_TYPES = new Set(["USER_LEFT"]); // extend as new habit-worthy events are added
+
+const logs = new Map(); // sessionId -> { eventType: [timestamps] }
+
+function getLog(sessionId) {
+  if (!logs.has(sessionId)) logs.set(sessionId, {});
+  return logs.get(sessionId);
+}
+
+function averageTimeOfDay(timestamps) {
+  const minutes = timestamps.map((t) => {
+    const d = new Date(t);
+    return d.getHours() * 60 + d.getMinutes();
+  });
+  const avg = minutes.reduce((a, b) => a + b, 0) / minutes.length;
+  const h = Math.floor(avg / 60);
+  const m = Math.round(avg % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+export async function recordEventForHabits(sessionId, event) {
+  if (!HABIT_TYPES.has(event.type)) return;
+
+  const log = getLog(sessionId);
+  log[event.type] = log[event.type] || [];
+  log[event.type].push(Date.now());
+
+  if (log[event.type].length < MIN_SAMPLES) return;
+
+  const recent = log[event.type].slice(-14);
+  const avgTime = averageTimeOfDay(recent);
+
+  await saveMemory(sessionId, {
+    action: "update",
+    content: `The user usually leaves around ${avgTime}.`,
+    category: "habit",
+    importance: 6,
+  });
+}
+```
+
+===============================================================================
+FILE: server/services/vision/observationGenerator.js
+===============================================================================
+
+```js
+function formatDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} seconds`;
+  const minutes = Math.round(seconds / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+const EMOTION_PHRASES = {
+  happiness: "smiling",
+  sadness: "looking a bit down",
+  anger: "looking upset",
+  surprise: "looking surprised",
+  fear: "looking uneasy",
+  disgust: "looking uncomfortable",
+  contempt: "looking unimpressed",
+  neutral: "calm",
+};
+
+export function generateObservation(event) {
+  switch (event.type) {
+    case "USER_LEFT":
+      return "The user has stepped away.";
+
+    case "USER_RETURNED":
+      return `The user just came back after being away for about ${formatDuration(event.data.awayMs)}.`;
+
+    case "MULTIPLE_PEOPLE":
+      return `There are now ${event.data.count} people in view.`;
+
+    default:
+      if (event.type.startsWith("EMOTION_STABLE_")) {
+        const phrase = EMOTION_PHRASES[event.data.emotion] || `feeling ${event.data.emotion}`;
+        return `The user has been ${phrase} for about ${formatDuration(event.data.durationMs)}.`;
+      }
+      return null;
+  }
+}
+```
+
+===============================================================================
 FILE: server/services/vision/visionService.js
 ===============================================================================
 
 ```js
+import { analyzeFrame } from "../../ml/pipeline.js";
+import { toImageBuffer } from "../../ml/camera/frameProcessor.js";
+import { updateState } from "./visionStateManager.js";
+import { generateEvents } from "./eventGenerator.js";
+import { generateObservation } from "./observationGenerator.js";
+import { canSpeak, markSpeaking, markSpoken } from "./cooldownManager.js";
+import { buildVisionContext } from "./contextBuilder.js";
+import { speakObservation } from "../chat/proactiveChat.js";
+import { recordEventForHabits } from "./habitLearner.js";
+
+export const processFrame = async ({ sessionId, frame, isUserTalking }) => {
+  const imageBuffer = toImageBuffer(frame);
+  const frameResult = await analyzeFrame(imageBuffer);
+
+  const { previous, current } = updateState(sessionId, frameResult);
+  const events = generateEvents(previous, current);
+
+  const spoken = [];
+
+  for (const event of events) {
+    await recordEventForHabits(sessionId, event); // learn regardless of whether Friday speaks
+
+    const observation = generateObservation(event);
+    if (!observation) continue;
+    if (!canSpeak(sessionId, event, { isUserTalking })) continue;
+
+    markSpeaking(sessionId, true);
+    try {
+      const context = await buildVisionContext({ sessionId, observation, state: current });
+      const result = await speakObservation({ sessionId, context });
+
+      if (result) {
+        markSpoken(sessionId, event);
+        spoken.push(result);
+      }
+    } finally {
+      markSpeaking(sessionId, false);
+    }
+  }
+
+  return { state: current, events, spoken };
+};
+```
+
+===============================================================================
+FILE: server/services/vision/visionStateManager.js
+===============================================================================
+
+```js
+// Internal-only per-session vision state. Never sent to the LLM directly.
+
+const sessions = new Map();
+
+function getDefaultState() {
+  return {
+    initialized: false,
+    present: false,
+    faceCount: 0,
+    emotion: null,
+    emotionConfidence: 0,
+    emotionSince: null,
+    lastSeenAt: null,
+    absentSince: null,
+    presentSince: null,
+    firedEmotionStableAt: null,
+    firedLeftAt: null,
+  };
+}
+
+export function getState(sessionId) {
+  if (!sessions.has(sessionId)) {
+    sessions.set(sessionId, getDefaultState());
+  }
+  return sessions.get(sessionId);
+}
+
+export function resetState(sessionId) {
+  sessions.set(sessionId, getDefaultState());
+}
+
+export function updateState(sessionId, frameResult) {
+  const state = getState(sessionId);
+  const now = frameResult.timestamp || Date.now();
+
+  const previous = { ...state };
+
+  const faceCount = frameResult.people || 0;
+  const isPresent = faceCount > 0;
+
+  const dominantFace =
+    faceCount > 0
+      ? [...frameResult.faces].sort(
+          (a, b) => (b.emotion?.confidence || 0) - (a.emotion?.confidence || 0)
+        )[0]
+      : null;
+
+  const emotion = dominantFace?.emotion?.emotion || null;
+  const emotionConfidence = dominantFace?.emotion?.confidence || 0;
+
+  if (isPresent) {
+    state.lastSeenAt = now;
+    if (!state.present) {
+      state.presentSince = now;
+      state.absentSince = null;
+      state.firedLeftAt = null;
+    }
+  } else if (state.present) {
+    state.absentSince = now;
+    state.presentSince = null;
+  }
+
+  state.present = isPresent;
+  state.faceCount = faceCount;
+
+  if (emotion && emotion !== state.emotion) {
+    state.emotion = emotion;
+    state.emotionSince = now;
+    state.firedEmotionStableAt = null;
+  }
+  state.emotionConfidence = emotionConfidence;
+
+  state.initialized = true; // set after snapshotting `previous`
+
+  return { previous, current: state };
+}
+
+
+
+export function getStateSummary(sessionId) {
+  const state = getState(sessionId);
+
+  return {
+    initialized: state.initialized,
+    present: state.present,
+    faceCount: state.faceCount,
+    emotion: state.emotion,
+    emotionConfidence: state.emotionConfidence,
+    lastSeenAt: state.lastSeenAt,
+  };
+}
 ```
 
 ===============================================================================
@@ -3639,4 +4751,4 @@ export const generateSpeech = async (text) => {
 
 Generated by ctx
 
-Total Files: 79
+Total Files: 86

@@ -9,6 +9,26 @@ const TTS_BAR_WEIGHTS = [0.72, 0.88, 1.05, 1.05, 0.88, 0.72];
 const IDLE_HEIGHT = 48;
 const PEAK_RANGE = 140;
 
+function VisionStatRow({ label, value, valueColor = "#fff" }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        fontSize: "12.5px",
+        padding: "8px 0",
+        borderBottom: "1px solid rgba(255,255,255,0.04)",
+      }}
+    >
+      <span style={{ color: "rgba(255,255,255,0.45)", fontWeight: 400 }}>{label}</span>
+      <span style={{ color: valueColor, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 function App() {
   const [message, setMessage] = useState("");
   const [response, setResponse] = useState("");
@@ -22,6 +42,18 @@ function App() {
     () => localStorage.getItem("friday-speaker") === "true",
   );
   const [levels, setLevels] = useState([48, 48, 48, 48, 48, 48]);
+
+  // --- Unified vision mode: only one camera consumer can run at a time ---
+  // 'off'   -> no camera in use
+  // 'live'  -> browser webcam streams frames to /api/vision/frame (interactive Friday)
+  // 'debug' -> ml-server (Python/OpenCV) camera + debug panel
+  const [visionMode, setVisionMode] = useState(
+    () => localStorage.getItem("friday-vision-mode") || "off",
+  );
+  const [visionData, setVisionData] = useState({ faces: [], timestamp: null });
+  const [visionOnline, setVisionOnline] = useState(false);
+  const [cameraRunning, setCameraRunning] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
 
   const sessionId = useRef(
     localStorage.getItem("friday-session") || crypto.randomUUID(),
@@ -52,6 +84,15 @@ function App() {
   const speechVoicesRef = useRef([]);
   const isSpeakingRef = useRef(false);
 
+  // Interactive vision refs
+  const webcamStreamRef = useRef(null);
+  const webcamVideoRef = useRef(null);
+  const webcamCanvasRef = useRef(null);
+  const frameCaptureIntervalRef = useRef(null);
+  const isSendingFrameRef = useRef(false);
+  const speakerOnRef = useRef(speakerOn);
+  const isUserTalkingRef = useRef(false);
+
   // Load voices when they become available
   useEffect(() => {
     // Get voices immediately if available
@@ -71,6 +112,15 @@ function App() {
       window.speechSynthesis.onvoiceschanged = null;
     };
   }, []);
+
+  // Keep refs in sync to avoid stale closures
+  useEffect(() => {
+    speakerOnRef.current = speakerOn;
+  }, [speakerOn]);
+
+  useEffect(() => {
+    isUserTalkingRef.current = isListening;
+  }, [isListening]);
 
   useEffect(() => {
     if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
@@ -105,10 +155,71 @@ function App() {
     }
   }, [response, showResponse]);
 
+  // Poll ml-server for live face/emotion results while in debug mode
+  useEffect(() => {
+    if (visionMode !== "debug") return;
+
+    let cancelled = false;
+
+    const checkStatusAndStart = async () => {
+      try {
+        const res = await fetch("http://localhost:5001/vision/status");
+        const data = await res.json();
+        if (cancelled) return;
+        setVisionOnline(true);
+        setCameraRunning(data.running);
+        if (!data.running) {
+          startCamera();
+        }
+      } catch (e) {
+        if (!cancelled) setVisionOnline(false);
+      }
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch("http://localhost:5001/vision/result");
+        const data = await res.json();
+        if (!cancelled) {
+          setVisionData(data);
+          setVisionOnline(true);
+        }
+      } catch (e) {
+        if (!cancelled) setVisionOnline(false);
+      }
+    };
+
+    checkStatusAndStart();
+    poll();
+    const interval = setInterval(poll, 500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionMode]);
+
+  // Interactive (browser webcam) capture — only runs in 'live' mode
+  useEffect(() => {
+    localStorage.setItem("friday-vision-mode", visionMode);
+
+    if (visionMode === "live") {
+      startVisionCapture();
+    } else {
+      stopVisionCapture();
+    }
+
+    return () => stopVisionCapture();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionMode]);
+
   useEffect(() => {
     return () => {
       stopMicVisualizer();
       stopTTSPlayback();
+      stopVisionCapture();
+      if (cameraRunning) stopCamera();
       if (speechUtteranceRef.current) {
         window.speechSynthesis.cancel();
       }
@@ -189,17 +300,17 @@ function App() {
       if (!isSpeakingRef.current) return;
 
       const elapsed = (Date.now() - ttsStartTimeRef.current) / 1000;
-      
+
       // Generate a realistic speech-like waveform using multiple sine waves
       // and noise to simulate speech patterns
-      const speechPattern = 
+      const speechPattern =
         Math.sin(elapsed * 2.5) * 0.4 + // Base rhythm
         Math.sin(elapsed * 4.7 + 0.5) * 0.3 + // Faster variation
         Math.sin(elapsed * 1.2 + 1.2) * 0.2 + // Slower modulation
         (Math.sin(elapsed * 8.3) * 0.1 + 0.5) * 0.2; // Noise-like variation
 
       // Normalize to 0-1 range with some envelope shaping
-      const normalized = Math.max(0, Math.min(1, 
+      const normalized = Math.max(0, Math.min(1,
         (speechPattern + 0.8) / 1.6 * 0.9 + 0.1
       ));
 
@@ -233,12 +344,12 @@ function App() {
 
   const stopTTSPlayback = () => {
     isSpeakingRef.current = false;
-    
+
     if (ttsRafRef.current) {
       cancelAnimationFrame(ttsRafRef.current);
       ttsRafRef.current = null;
     }
-    
+
     // Stop speech synthesis
     if (speechUtteranceRef.current) {
       window.speechSynthesis.cancel();
@@ -259,7 +370,7 @@ function App() {
 
   const playTTS = (text) => {
     if (!text.trim()) return;
-    
+
     // Cancel any ongoing speech
     window.speechSynthesis.cancel();
     stopTTSPlayback();
@@ -276,18 +387,18 @@ function App() {
 
       // Find Google UK English Female voice
       const voices = speechVoicesRef.current;
-      const preferredVoice = voices.find(v => 
-        v.name === "Google UK English Female" || 
+      const preferredVoice = voices.find(v =>
+        v.name === "Google UK English Female" ||
         v.name.includes("Google UK English Female")
       );
-      
+
       if (preferredVoice) {
         utterance.voice = preferredVoice;
         console.log("Using voice:", preferredVoice.name);
       } else {
         // Fallback to any Google voice or English voice
-        const fallbackVoice = voices.find(v => 
-          v.name.includes("Google") || 
+        const fallbackVoice = voices.find(v =>
+          v.name.includes("Google") ||
           v.lang.startsWith("en")
         );
         if (fallbackVoice) {
@@ -322,6 +433,126 @@ function App() {
     }
   };
 
+  const playRemoteAudio = (base64Audio) => {
+    if (!base64Audio) return;
+
+    window.speechSynthesis.cancel();
+    stopTTSPlayback();
+
+    const audio = new Audio(`data:audio/mpeg;base64,${base64Audio}`);
+
+    ttsStartTimeRef.current = Date.now();
+    setIsSpeaking(true);
+    startTTSVisualizer();
+
+    audio.onended = () => stopTTSPlayback();
+    audio.onerror = (e) => {
+      console.error("Vision audio playback error:", e);
+      stopTTSPlayback();
+    };
+
+    audio.play().catch((err) => {
+      console.error("Audio play blocked:", err);
+      stopTTSPlayback();
+    });
+  };
+
+  const captureAndSendFrame = async () => {
+    if (isSendingFrameRef.current) return;
+
+    const video = webcamVideoRef.current;
+    const canvas = webcamCanvasRef.current;
+    if (!video || !canvas || video.readyState < 2) return;
+
+    isSendingFrameRef.current = true;
+
+    try {
+      const ctx = canvas.getContext("2d");
+      canvas.width = video.videoWidth || 480;
+      canvas.height = video.videoHeight || 360;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const frame = canvas.toDataURL("image/jpeg", 0.7);
+
+      const res = await fetch("http://localhost:5000/api/vision/frame", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: sessionId.current,
+          frame,
+          isUserTalking: isUserTalkingRef.current,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (data?.responses?.length) {
+        const [first] = data.responses;
+
+        setInputMode(null);
+        setResponse(formatResponse(first.text));
+        setShowResponse(true);
+
+        if (speakerOnRef.current) {
+          playRemoteAudio(first.audio);
+        }
+      }
+    } catch (err) {
+      console.error("Vision frame error:", err);
+    } finally {
+      isSendingFrameRef.current = false;
+    }
+  };
+
+  const startVisionCapture = async () => {
+    try {
+      // Release the Python-side camera first so the browser can claim the device
+      if (cameraRunning) {
+        await stopCamera();
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 480, height: 360 },
+      });
+
+      webcamStreamRef.current = stream;
+
+      if (webcamVideoRef.current) {
+        webcamVideoRef.current.srcObject = stream;
+        await webcamVideoRef.current.play();
+      }
+
+      frameCaptureIntervalRef.current = setInterval(captureAndSendFrame, 3000);
+    } catch (err) {
+      console.error("Vision capture error:", err);
+      setVisionMode("off");
+    }
+  };
+
+  const stopVisionCapture = () => {
+    if (frameCaptureIntervalRef.current) {
+      clearInterval(frameCaptureIntervalRef.current);
+      frameCaptureIntervalRef.current = null;
+    }
+    webcamStreamRef.current?.getTracks().forEach((t) => t.stop());
+    webcamStreamRef.current = null;
+  };
+
+  const switchVisionMode = async (mode) => {
+    if (mode === visionMode) return;
+
+    // Always release the browser camera before switching away from 'live'
+    if (visionMode === "live") {
+      stopVisionCapture();
+    }
+    // Always release the Python camera before switching away from 'debug'
+    if (visionMode === "debug" && cameraRunning) {
+      await stopCamera();
+    }
+
+    setVisionMode(mode);
+  };
+
   const toggleListening = async () => {
     if (isListening) {
       recognitionRef.current?.stop();
@@ -346,6 +577,35 @@ function App() {
       if (!next) stopTTSPlayback();
       return next;
     });
+  };
+
+  const startCamera = async () => {
+    setCameraStarting(true);
+    try {
+      const res = await fetch("http://localhost:5001/vision/start", {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (data.status === "started" || data.status === "already_running") {
+        setCameraRunning(true);
+      } else {
+        console.error("Camera start failed:", data.message);
+      }
+    } catch (err) {
+      console.error("Camera start error:", err);
+    } finally {
+      setCameraStarting(false);
+    }
+  };
+
+  const stopCamera = async () => {
+    try {
+      await fetch("http://localhost:5001/vision/stop", { method: "POST" });
+    } catch (err) {
+      console.error("Camera stop error:", err);
+    } finally {
+      setCameraRunning(false);
+    }
   };
 
   const handleTextSubmit = (e) => {
@@ -451,25 +711,87 @@ function App() {
         <div style={{ color: "#fff", fontSize: "18px", fontWeight: 500, letterSpacing: "0.5px" }}>
           Friday
         </div>
-        {response && (
-          <button
-            onClick={toggleResponseView}
-            style={{
-              background: "none",
-              border: `1px solid ${showResponse ? "#0a84ff" : "rgba(255,255,255,0.2)"}`,
-              color: showResponse ? "#0a84ff" : "#fff",
-              padding: "6px 16px",
-              borderRadius: "20px",
-              fontSize: "13px",
-              cursor: "pointer",
-              transition: "all 0.3s",
-              fontFamily: "inherit",
-              letterSpacing: "0.3px",
-            }}
-          >
-            {showResponse ? "Hide Response" : "View Response"}
-          </button>
-        )}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            borderRadius: "22px",
+            padding: "4px",
+          }}
+        >
+          {[
+            { key: "off", label: "Vision Off" },
+            { key: "live", label: "Friday's Watching" },
+            { key: "debug", label: "Debug" },
+          ].map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => switchVisionMode(key)}
+              style={{
+                background: visionMode === key ? "#fff" : "transparent",
+                color: visionMode === key ? "#000" : "rgba(255,255,255,0.6)",
+                border: "none",
+                padding: "7px 14px",
+                borderRadius: "18px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: "pointer",
+                letterSpacing: "0.2px",
+                transition: "all 0.25s ease",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              {key === "live" && (
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: visionMode === "live" ? "#0a84ff" : "rgba(255,255,255,0.3)",
+                  }}
+                />
+              )}
+              {key === "debug" && (
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor:
+                      visionMode === "debug" && visionOnline ? "#34c759" : "rgba(255,255,255,0.3)",
+                  }}
+                />
+              )}
+              {label}
+            </button>
+          ))}
+
+          {response && (
+            <button
+              onClick={toggleResponseView}
+              style={{
+                background: showResponse ? "#0a84ff" : "transparent",
+                color: showResponse ? "#fff" : "rgba(255,255,255,0.6)",
+                border: "none",
+                padding: "7px 14px",
+                borderRadius: "18px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: "pointer",
+                letterSpacing: "0.2px",
+                marginLeft: "6px",
+              }}
+            >
+              {showResponse ? "Hide" : "Response"}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Main Content Area */}
@@ -846,6 +1168,167 @@ function App() {
           </motion.button>
         </div>
       </div>
+
+      {/* Hidden video and canvas for interactive vision capture */}
+      <video ref={webcamVideoRef} style={{ display: "none" }} muted playsInline />
+      <canvas ref={webcamCanvasRef} style={{ display: "none" }} />
+
+      {/* Vision Debug Panel */}
+      <AnimatePresence>
+        {visionMode === "debug" && (
+          <motion.div
+            initial={{ opacity: 0, x: 20, scale: 0.98 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 20, scale: 0.98 }}
+            style={{
+              position: "fixed",
+              right: "20px",
+              top: "80px",
+              width: "340px",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              background: "linear-gradient(180deg, #131313 0%, #0a0a0a 100%)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: "16px",
+              padding: "18px",
+              color: "#fff",
+              zIndex: 100,
+              fontFamily: "'SF Pro Display', -apple-system, sans-serif",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "14px",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  letterSpacing: "0.4px",
+                  textTransform: "uppercase",
+                  color: "rgba(255,255,255,0.5)",
+                }}
+              >
+                Vision Debug
+              </span>
+              <span
+                style={{
+                  fontSize: "11px",
+                  color: visionOnline ? "#34c759" : "#ff3b30",
+                  fontWeight: 600,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "5px",
+                }}
+              >
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: visionOnline ? "#34c759" : "#ff3b30",
+                  }}
+                />
+                {visionOnline ? "Online" : "Offline"}
+              </span>
+            </div>
+
+            <button
+              onClick={cameraRunning ? stopCamera : startCamera}
+              disabled={cameraStarting}
+              style={{
+                width: "100%",
+                background: cameraRunning ? "rgba(255,59,48,0.12)" : "rgba(52,199,89,0.12)",
+                border: `1px solid ${cameraRunning ? "rgba(255,59,48,0.4)" : "rgba(52,199,89,0.4)"}`,
+                color: cameraRunning ? "#ff6961" : "#41d67c",
+                padding: "9px 0",
+                borderRadius: "10px",
+                fontSize: "12.5px",
+                fontWeight: 600,
+                cursor: cameraStarting ? "not-allowed" : "pointer",
+                opacity: cameraStarting ? 0.5 : 1,
+                marginBottom: "12px",
+              }}
+            >
+              {cameraStarting ? "Starting…" : cameraRunning ? "Stop Camera" : "Start Camera"}
+            </button>
+
+            <img
+              src="http://localhost:5001/vision/stream"
+              alt="Live camera feed"
+              style={{
+                width: "100%",
+                borderRadius: "10px",
+                display: "block",
+                marginBottom: "16px",
+                backgroundColor: "#000",
+                minHeight: "180px",
+                objectFit: "cover",
+                border: "1px solid rgba(255,255,255,0.06)",
+              }}
+              onError={(e) => {
+                e.currentTarget.style.opacity = "0.3";
+              }}
+            />
+
+            <div
+              style={{
+                background: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.06)",
+                borderRadius: "10px",
+                padding: "4px 12px",
+              }}
+            >
+              <VisionStatRow
+                label="Face Present"
+                value={visionData.faces?.length > 0 ? "Yes" : "No"}
+                valueColor={visionData.faces?.length > 0 ? "#34c759" : "#ff9f0a"}
+              />
+              <VisionStatRow label="People" value={visionData.faces?.length ?? 0} />
+              <VisionStatRow
+                label="Emotion"
+                value={visionData.faces?.[0]?.emotion ?? "-"}
+              />
+              <VisionStatRow
+                label="Confidence"
+                value={
+                  visionData.faces?.[0]?.confidence
+                    ? `${(visionData.faces[0].confidence * 100).toFixed(1)}%`
+                    : "-"
+                }
+              />
+              {visionData.faces?.[0]?.box && (
+                <VisionStatRow
+                  label="Box"
+                  value={`${Math.round(visionData.faces[0].box.width)}×${Math.round(
+                    visionData.faces[0].box.height,
+                  )}`}
+                />
+              )}
+            </div>
+
+            <div
+              style={{
+                marginTop: "12px",
+                fontSize: "10.5px",
+                color: "rgba(255,255,255,0.3)",
+                textAlign: "right",
+                letterSpacing: "0.2px",
+              }}
+            >
+              Updated{" "}
+              {visionData.timestamp
+                ? new Date(visionData.timestamp * 1000).toLocaleTimeString()
+                : "—"}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

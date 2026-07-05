@@ -64,52 +64,7 @@ export const getMemories = async (sessionId) => {
     .limit(20);
 };
 
-// export const searchMemories = async (
-//   sessionId,
-//   embedding,
-//   limit = 5
-// ) => {
-//   const results = await Memory.aggregate([
-//     {
-//       $vectorSearch: {
-//         index: "memory_index",
-//         path: "embedding",
-//         queryVector: embedding,
-//         numCandidates: 100,
-//         limit: 20,
-//       },
-//     },
-//     {
-//       $match: {
-//         sessionId,
-//       },
-//     },
-//     {
-//       $limit: limit,
-//     },
-//     {
-//       $project: {
-//         _id: 1,
-//         content: 1,
-//         category: 1,
-//         importance: 1,
-//         score: {
-//           $meta: "vectorSearchScore",
-//         },
-//       },
-//     },
-//   ]);
 
-//   const filtered = results.filter(
-//     (memory) => memory.score >= 0.75
-//   );
-
-//   await updateMemoryAccess(
-//     filtered.map((memory) => memory._id)
-//   );
-
-//   return filtered;
-// };
 
 export const updateMemoryAccess = async (memoryIds) => {
   if (!memoryIds.length) return;
